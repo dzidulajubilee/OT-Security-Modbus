@@ -3,7 +3,6 @@ import random
 import logging
 import argparse
 import csv
-import socket
 import ipaddress
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
@@ -12,182 +11,169 @@ from pymodbus.exceptions import ModbusException
 
 logging.basicConfig(level=logging.INFO)
 
-# ───── CONNECT ─────
+# Known Vendor Signatures
+DEVICE_SIGNATURES = {
+    "Schneider Electric": "Schneider PLC",
+    "Siemens": "Siemens S7",
+    "WAGO": "WAGO Controller",
+    "Mitsubishi": "Mitsubishi Electric PLC",
+    "Modicon": "Modicon PLC",
+    "Rockwell": "Allen-Bradley PLC",
+    "Delta": "Delta PLC"
+}
+
 def connect(ip, port=502):
     client = ModbusTcpClient(ip, port=port)
     if client.connect():
         return client
     return None
 
-# ───── BANNER GRAB ─────
-def banner_grab(ip, port=502):
-    try:
-        s = socket.create_connection((ip, port), timeout=2)
-        s.send(b'\x00\x00\x00\x06\x01\x03\x00\x00\x00\x01')
-        data = s.recv(1024)
-        s.close()
-        return data.hex()
-    except Exception:
-        return None
+def identify_vendor(info):
+    for k, v in info.items():
+        for sig in DEVICE_SIGNATURES:
+            if sig.lower() in str(v).lower():
+                return DEVICE_SIGNATURES[sig]
+    return "Unknown Device"
 
-# ───── FALLBACK FINGERPRINT ─────
-def fallback_fingerprint(client, ip):
-    patterns = scan_registers(client, ip, start=0, end=10, step=2)
-    banner = banner_grab(ip)
-    return {
-        "Host": ip,
-        "Type": "fallback_fingerprint",
-        "Status": "OK",
-        "Banner": banner if banner else "None",
-        "RegisterSample": str(patterns)
-    }
-
-# ───── DEVICE FINGERPRINTING ─────
-def fingerprint_device(client, ip):
+def fingerprint_device(client, ip, port):
     try:
         response = client.read_device_information()
         if response.isError():
-            return fallback_fingerprint(client, ip)
-        info = {"Host": ip, "Type": "device_info", "Status": "OK"}
+            print(f"{ip}:{port} - No response to device info request")
+            return None
+        info = {
+            "Host": ip,
+            "Port": port,
+            "Type": "device_info",
+            "Status": "OK"
+        }
         for obj_id, value in response.information.items():
             info[f"device_{obj_id}"] = value
+        info["Vendor"] = identify_vendor(response.information)
+        print(f"{ip}:{port} - Fingerprinted as {info['Vendor']}")
         return info
-    except Exception:
-        return fallback_fingerprint(client, ip)
+    except Exception as e:
+        print(f"{ip}:{port} - Fingerprint failed: {e}")
+        return {"Host": ip, "Port": port, "Type": "device_info", "Status": f"Exception: {e}"}
 
-# ───── SCANNERS ─────
-def scan_registers(client, ip, start=0, end=100, step=10, reg_type="holding"):
-    results = []
-    for addr in range(start, end, step):
+def check_modbus(ip, ports, skip_logs=False):
+    for port in ports:
         try:
-            if reg_type == "holding":
-                response = client.read_holding_registers(address=addr, count=step)
-            else:
-                response = client.read_input_registers(address=addr, count=step)
-            status = "OK" if not response.isError() else "Error"
-            values = response.registers if not response.isError() else []
+            client = ModbusTcpClient(str(ip), port=port)
+            if not client.connect():
+                if not skip_logs:
+                    logging.error(f"Connection to ({ip}, {port}) failed.")
+                continue
+            resp = client.read_coils(address=0, count=1)
+            if not resp.isError():
+                logging.info(f"Modbus detected: {ip}:{port}")
+                client.close()
+                return str(ip), port
+            client.close()
         except Exception as e:
-            status = f"Exception: {e}"
-            values = []
-        results.append({"Host": ip, "Type": reg_type, "Address": addr, "Values": values, "Status": status})
-    return results
+            if not skip_logs:
+                logging.error(f"{ip}:{port} raised {e}")
+    return None
 
-def scan_coils(client, ip, start=0, end=100, step=10):
-    results = []
-    for addr in range(start, end, step):
-        try:
-            response = client.read_coils(address=addr, count=step)
-            status = "OK" if not response.isError() else "Error"
-            values = response.bits if not response.isError() else []
-        except Exception as e:
-            status = f"Exception: {e}"
-            values = []
-        results.append({"Host": ip, "Type": "coil", "Address": addr, "Values": values, "Status": status})
-    return results
+def scan_subnet(subnet, ports, skip_logs):
+    logging.info(f"Scanning subnet {subnet} on ports {ports}...")
+    live_hosts = []
+    with ThreadPoolExecutor(max_workers=50) as executor:
+        futures = [executor.submit(check_modbus, ip, ports, skip_logs) for ip in ipaddress.IPv4Network(subnet).hosts()]
+        for f in futures:
+            result = f.result()
+            if result:
+                live_hosts.append(result)
+    logging.info(f"Found {len(live_hosts)} Modbus hosts.")
+    print("\nSummary of detected hosts:")
+    for ip, port in live_hosts:
+        print(f"  - {ip}:{port}")
+    return live_hosts
 
-# ───── FUZZERS ─────
-def fuzz_registers(client, ip, count=5, iterations=10):
-    results = []
-    for _ in range(iterations):
-        addr = random.randint(0, 120)
-        values = [random.randint(0, 65535) for _ in range(count)]
-        try:
-            response = client.write_registers(address=addr, values=values)
-            status = "OK" if not response.isError() else "Error"
-        except Exception as e:
-            status = f"Exception: {e}"
-        results.append({"Host": ip, "Type": "fuzz_register", "Address": addr, "Values": values, "Status": status})
-    return results
+def save_csv(filename, data):
+    keys = data[0].keys()
+    with open(filename, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
+        writer.writeheader()
+        writer.writerows(data)
 
-# ───── REPORTING ─────
 def save_html(filename, data, title="Modbus Multi-Host Report"):
-    html = f"""<html><head><title>{title}</title><style>
-    body {{ font-family: Arial; }}
-    table {{ border-collapse: collapse; width: 100%; }}
-    th, td {{ border: 1px solid #ddd; padding: 8px; }}
-    th {{ background-color: #444; color: #fff; }}
-    tr:nth-child(even) {{ background-color: #f9f9f9; }}
-    .OK {{ color: green; }} .Error, .Exception {{ color: red; }}
-    </style></head><body><h2>{title}</h2><table>
-    <tr>{''.join(f'<th>{k}</th>' for k in data[0].keys())}</tr>
-    """
+    html = f"""<html><head><title>{title}</title>
+<style>
+  body {{ font-family: Arial; }}
+  table {{ border-collapse: collapse; width: 100%; }}
+  th, td {{ border: 1px solid #ddd; padding: 8px; }}
+  th {{ background-color: #444; color: #fff; }}
+  tr:nth-child(even) {{ background-color: #f9f9f9; }}
+  .OK {{ color: green; }}
+  .Error, .Exception {{ color: red; }}
+</style></head><body>
+<h2>{title}</h2>
+<table>
+<tr>""" + "".join(f"<th>{k}</th>" for k in data[0].keys()) + "</tr>\n"
+
     for row in data:
         html += "<tr>"
         for k, v in row.items():
             css = str(v).split(":")[0] if k == "Status" else ""
             html += f"<td class='{css}'>{v}</td>"
-        html += "</tr>"
+        html += "</tr>\n"
     html += "</table></body></html>"
+
     with open(filename, "w") as f:
         f.write(html)
 
-# ───── SUBNET SCANNER ─────
-def check_modbus(ip, port):
-    client = connect(ip, port)
-    if client:
-        try:
-            resp = client.read_coils(0, 1)
-            if not resp.isError():
-                return ip
-        except:
-            pass
-        client.close()
-    return None
-
-def scan_subnet(subnet, port=502):
-    logging.info(f"🔎 Scanning subnet {subnet} for Modbus devices...")
-    live_hosts = []
-    with ThreadPoolExecutor(max_workers=50) as executor:
-        futures = [executor.submit(check_modbus, str(ip), port) for ip in ipaddress.IPv4Network(subnet).hosts()]
-        for f in futures:
-            result = f.result()
-            if result:
-                logging.info(f"[+] Modbus detected: {result}")
-                live_hosts.append(result)
-    logging.info(f"✅ Found {len(live_hosts)} Modbus hosts.")
-    return live_hosts
-
-# ───── MAIN ─────
 def main():
-    parser = argparse.ArgumentParser(description="Modbus Toolkit")
-    parser.add_argument("--ip")
-    parser.add_argument("--subnet")
-    parser.add_argument("--port", type=int, default=502)
-    parser.add_argument("--fingerprint", action="store_true")
-    parser.add_argument("--skip-unresponsive", action="store_true")
-    parser.add_argument("--report", choices=["html"])
+    parser = argparse.ArgumentParser(description="Modbus Toolkit with Subnet & Fingerprint Support")
+    parser.add_argument("--ip", help="Target IP address")
+    parser.add_argument("--subnet", help="Scan a subnet (e.g., 192.168.1.0/24)")
+    parser.add_argument("--port-range", type=str, default="502", help="e.g., 502 or 502-504")
+    parser.add_argument("--skip-unresponsive", action="store_true", help="Suppress connection timeout logs")
+    parser.add_argument("--fingerprint", action="store_true", help="Attempt device fingerprinting")
+    parser.add_argument("--report", choices=["csv", "html"], help="Generate report")
+
     args = parser.parse_args()
+
+    if "-" in args.port_range:
+        start, end = map(int, args.port_range.split("-"))
+        ports = list(range(start, end + 1))
+    else:
+        ports = [int(args.port_range)]
+
+    if not args.subnet and not args.ip:
+        print("Please specify either --ip or --subnet.")
+        sys.exit(1)
 
     targets = []
     if args.subnet:
-        targets = scan_subnet(args.subnet, args.port)
+        targets = scan_subnet(args.subnet, ports, skip_logs=args.skip_unresponsive)
     elif args.ip:
-        targets = [args.ip]
-    else:
-        print("❌ Provide --ip or --subnet")
-        sys.exit(1)
+        targets = [(args.ip, ports[0])]
 
     all_results = []
-    for ip in targets:
-        try:
-            client = connect(ip, port=args.port)
-            if not client:
-                continue
-            logging.info(f"🔗 Connected to {ip}")
-            if args.fingerprint:
-                info = fingerprint_device(client, ip)
-                if info:
-                    all_results.append(info)
-            client.close()
-        except Exception as e:
-            if not args.skip_unresponsive:
-                logging.error(f"{ip}: {e}")
 
-    if all_results and args.report == "html":
+    for ip, port in targets:
+        client = connect(ip, port=port)
+        if not client:
+            continue
+        logging.info(f"Connected to {ip}:{port}")
+
+        if args.fingerprint:
+            result = fingerprint_device(client, ip, port)
+            if result:
+                all_results.append(result)
+
+        client.close()
+
+    if all_results and args.report:
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        fn = f"modbus_report_{ts}.html"
-        save_html(fn, all_results)
-        print(f"🌐 HTML saved: {fn}")
+        base = f"modbus_report_{ts}"
+        if args.report == "csv":
+            save_csv(f"{base}.csv", all_results)
+            print(f"CSV saved: {base}.csv")
+        elif args.report == "html":
+            save_html(f"{base}.html", all_results)
+            print(f"HTML saved: {base}.html")
 
 if __name__ == "__main__":
     main()
