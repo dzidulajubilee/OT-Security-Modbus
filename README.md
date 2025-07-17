@@ -24,19 +24,19 @@ A Python-based toolkit for scanning, fingerprinting, and interacting with Modbus
 ### Basic Subnet Scan with Fingerprint
 
 ```bash
-python modbus_toolkit.py --subnet 10.20.20.0/24 --fingerprint --report html
+python modbus_toolkit.py --subnet 192.168.1.0/24  --fingerprint --report html
 ```
 
 ### Skip Error Spam from Unresponsive Devices
 
 ```bash
-python modbus_toolkit.py --subnet 10.20.20.0/24 --fingerprint --skip-unresponsive --report html
+python modbus_toolkit.py --subnet 192.168.1.0/24  --fingerprint --skip-unresponsive --report html
 ```
 
 ### Scan a Single Host
 
 ```bash
-python modbus_toolkit.py --ip 10.20.20.100 --fingerprint
+python modbus_toolkit.py --ip 192.168.1.100 --fingerprint
 ```
 
 ### Change Modbus Port
@@ -77,8 +77,11 @@ Install dependencies:
 ```bash
 pip install pymodbus
 ```
+install dependecies systemwide
 
----
+```bash
+sudo apt install python3-pymodbus
+```
 
 ## 📜 License
 
